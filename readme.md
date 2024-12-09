@@ -11,7 +11,7 @@ https://github.com/user-attachments/assets/f71f0349-0e11-4c31-94a7-b7a57275ccb3
 
 
 - [x] Release MVGamba-3DGS training and inference code.
-- [ ] Release MVGamba-2DGS training and inference code..
+- [ ] Release MVGamba-2DGS training and inference code.
 - [ ] Release pretrained checkpoints.
 
 ### Install
