@@ -1,0 +1,1 @@
+python infer.py mvgamba --resume /checkpoints/mvgamba_final_scaleup_ft_resume/mvgamba.pth --workspace test_result --test_path data_test --output_size 512
