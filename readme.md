@@ -11,7 +11,7 @@ https://github.com/user-attachments/assets/f71f0349-0e11-4c31-94a7-b7a57275ccb3
 
 
 - [x] Release MVGamba-3DGS training and inference code.
-- [x] Release MVGamba-2DGS training and inference code.
+- [x] Release MVGamba-2DGS training and inference code, please refer to the surfel branch.
 - [ ] Release pretrained checkpoints.
 
 ### Install
@@ -89,7 +89,5 @@ Please also check our another project for ultra fast single view 3D generation [
   journal={arXiv preprint arXiv:2403.18795},
   year={2024}
 }
-
-
 
 ```
