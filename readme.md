@@ -1,7 +1,7 @@
 
-## Multi-View Gamba Model for unified 3D Generation
+## Multi-View Gamba Model for Unified 3D Generation
 
-This is the official implementation of *MVGamba: Unify 3D Content Generation as State Space Sequence Modeling*.
+This is the official implementation of *MVGamba: Unify 3D Content Generation as State Space Sequence Modeling* (NeurIPS 2024).
 
 
 https://github.com/user-attachments/assets/f71f0349-0e11-4c31-94a7-b7a57275ccb3
