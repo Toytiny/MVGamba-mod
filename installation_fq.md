@@ -22,7 +22,8 @@ pip install xformers==0.0.28
 
 # 5. Other dependencies
 ```
-pip install causal-conv1d==1.2.0.post2
+pip install --no-build-isolation --no-cache-dir \
+  "git+https://github.com/Dao-AILab/causal-conv1d.git@v1.2.0.post2"
 ```
 
 # Install mamba-ssm with no-build-isolation and no-deps
