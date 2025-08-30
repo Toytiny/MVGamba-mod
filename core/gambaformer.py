@@ -5,6 +5,8 @@ import torch.nn as nn
 
 from functools import partial
 from mamba_ssm.modules.mamba_simple import Mamba
+# core/gambaformer.py
+# from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 from timm.models.layers import DropPath, to_2tuple
 # from typings import *

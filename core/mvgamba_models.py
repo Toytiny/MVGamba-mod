@@ -328,6 +328,7 @@ class GSPredictor(nn.Module):
         """
         
         # gs [N,gs_num, gs_dim:14]
+        cond_views = cond_views.float()
         bsz, cond_num, c, h, w = cond_views.size()
         cond_views = cond_views.view(bsz*cond_num, c, h, w)
 
@@ -344,6 +345,9 @@ class GSPredictor(nn.Module):
         else:
             img_cond = torch.cat([img_cond_1, img_cond_3], dim=-1)
         img_cond = img_cond.permute(0, 2, 1).reshape(bsz, -1, self.opt.gamba_dim)
+
+        with autocast(enabled=False):
+            feats = self.transformer(img_cond.float())
 
         feats = self.transformer(img_cond)
         feats = self.reshape_upsample(feats)
@@ -412,9 +416,11 @@ class MVGamba(torch.nn.Module):
         #flatten
         cond_poses = cond_poses.view(cond_poses.size(0), cond_poses.size(1), -1)  # (bsz, view_num, 16)
 
-        decoder_out = self.model(cond_views=cond_views.type(self.dtype), # (bsz, view_num, c, h, w)
-                                 cam_poses=cond_poses.type(self.dtype)) # (bsz, view_num, 16)
-        
+        # decoder_out = self.model(cond_views=cond_views.type(self.dtype)) # (bsz, view_num, c, h, w)
+                                #  cam_poses=cond_poses.type(self.dtype)) # (bsz, view_num, 16)
+        with autocast(enabled=False):
+            decoder_out = self.model(cond_views=cond_views.float())
+
         with autocast(enabled=False):
             # bg aug
             if not self.training or random.random() > self.opt.prob_bg_color:

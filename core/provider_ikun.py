@@ -46,20 +46,41 @@ class ObjaverseDataset(Dataset):
         
         self.plucker_ray = opt.plucker_ray
 
-        self.data_root = '/mnt/data/public/dataset/3D/gobj/'
-        self.items = []
+        # self.data_root = '/mnt/data/public/dataset/3D/gobj/'
+        # self.items = []
                 
-        self.items = self.load_json_data(os.path.join(self.data_root, 'gobj_merged.json'))
-        
-        if self.opt.overfit:  
-            initial_batch = self.items[:self.opt.batch_size*8]  
-            if len(initial_batch) > 0:  
-                num_repeats = len(self.items) // len(initial_batch)  
-                self.items = (initial_batch * num_repeats)[:len(self.items)]
-        elif self.training:
-            self.items = self.items[:-self.opt.batch_size]
+        # self.items = self.load_json_data(os.path.join(self.data_root, 'gobj_merged.json'))
+        # 用命令行 / 配置传进来的路径，如果没传就用默认
+        self.data_root = '/data/mvgamba_gobj'
+        ids_path = '/data/mvgamba_gobj/kiuisobj_v1_merged_80K.csv'
+
+        # 支持 json / csv 两种格式
+        if ids_path.endswith(".json"):
+            self.items = self.load_json_data(ids_path)
+
+        elif ids_path.endswith(".csv"):
+            import pandas as pd, re
+            df = pd.read_csv(ids_path)
+
+            # 找到 UUID 列（32位或带-的uuid）
+            def looks_like_uuid(s: str):
+                s = str(s).strip().lower()
+                return bool(re.fullmatch(r"[0-9a-f]{32}", s) or
+                            re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", s))
+
+            uuid_col = None
+            for c in df.columns:
+                if any(looks_like_uuid(v) for v in df[c].dropna().astype(str).head(50)):
+                    uuid_col = c
+                    break
+
+            if uuid_col is None:
+                raise ValueError(f"CSV 里没找到 uuid 列: {ids_path}")
+
+            self.items = [str(v).strip() for v in df[uuid_col].dropna().astype(str).tolist()]
+
         else:
-            self.items = self.items[-self.opt.batch_size:]
+            raise ValueError(f"不支持的清单格式: {ids_path}")
 
         # resolution mode (will randomly change during training) #TODO whether need such resolution mode?
         # 0: default render_size, will render normal and calc eikonal loss
@@ -131,11 +152,12 @@ class ObjaverseDataset(Dataset):
             vids = [0,6,12,18] + np.random.choice(range(25), 12, replace=False).tolist() 
             
         
-        uid_last = uid.split('/')[1]
+        uid_last = uid.split('/')[-1]
         tar_handler = tarfile.open(tar_path, 'r')
 
         for vid in vids:
             image_path = os.path.join(uid_last, 'campos_512_v4', f"{vid:05d}/{vid:05d}.png")
+            # print(image_path)
             meta_path = os.path.join(uid_last, 'campos_512_v4', f"{vid:05d}/{vid:05d}.json")
             albedo_path = os.path.join(uid_last, 'campos_512_v4', f"{vid:05d}/{vid:05d}_albedo.png") # black bg...
             mr_path = os.path.join(uid_last, 'campos_512_v4', f"{vid:05d}/{vid:05d}_mr.png")
@@ -168,10 +190,21 @@ class ObjaverseDataset(Dataset):
             dist = torch.norm(c2w[:3, 3]).item()
             c2w[:3, 3] *= self.opt.cam_radius / dist
           
-            image = image.permute(2, 0, 1) # [4, 512, 512]
-            mask = image[3:4] # [1, 512, 512]
-            image = image[:3] * mask + (1 - mask) # [3, 512, 512], to white bg
-            image = image[[2,1,0]].contiguous() # bgr to rgb
+            # image = image.permute(2, 0, 1) # [4, 512, 512]
+            # mask = image[3:4] # [1, 512, 512]
+            # image = image[:3] * mask + (1 - mask) # [3, 512, 512], to white bg
+            # image = image[[2,1,0]].contiguous() # bgr to rgb
+            image = image.permute(2, 0, 1)  # [C, H, W]
+            if image.shape[0] == 4:
+                # 有 alpha 通道
+                mask = image[3:4]  # [1, H, W]
+            else:
+                # 没有 alpha 通道，直接用全 1
+                mask = torch.ones(1, image.shape[1], image.shape[2], dtype=image.dtype)
+
+            image = image[:3] * mask + (1 - mask) * 1.0  # 前景保持，背景填白
+            image = image[[2, 1, 0]].contiguous()  # BGR→RGB
+
 
             # normal = normal.permute(2, 0, 1) # [3, 512, 512]
 

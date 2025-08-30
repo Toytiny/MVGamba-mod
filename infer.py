@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from safetensors.torch import load_file
 import rembg
-from core.mvgamba_models import Gamba
+from core.mvgamba_models import MVGamba
 import kiui
 from kiui.op import recenter
 from kiui.cam import orbit_camera
@@ -25,7 +25,7 @@ IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 import cv2
 opt = tyro.cli(AllConfigs)
 
-model = Gamba(opt)
+model = MVGamba(opt)
 
 # resume pretrained checkpoint
 if opt.resume is not None:

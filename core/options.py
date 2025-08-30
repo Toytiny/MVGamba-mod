@@ -87,7 +87,7 @@ class Options:
     # gradient clip
     gradient_clip: float = 1.0
     # mixed precision
-    mixed_precision: str = 'bf16'
+    mixed_precision: str = 'no'
     # learning rate
     lr: float = 1e-3
     # weight decay
