@@ -74,7 +74,7 @@ class Options:
     # resume
     resume: Optional[str] = None
     # batch size (per-GPU)
-    batch_size: int = 8
+    batch_size: int = 4
     # gradient accumulation
     gradient_accumulation_steps: int = 1
     # training epochs
