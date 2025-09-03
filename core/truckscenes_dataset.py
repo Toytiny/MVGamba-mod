@@ -4,12 +4,14 @@ import os.path as osp
 
 import numpy as np
 import torch
+import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import Dataset
 from truckscenes import TruckScenes
+from core.options import Options
 
-from core.trucksc import fused_radar_pc, trucksc_read
+from core.trucksc import fused_radar_pc, trucksc_read, frame_conversion
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -19,26 +21,100 @@ IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 CAMERA_VIEW_NAMES = ['CAMERA_RIGHT_FRONT', 'CAMERA_LEFT_FRONT', 'CAMERA_RIGHT_BACK', 'CAMERA_LEFT_BACK']
 
 
+class SquarePadPIL:
+    def __call__(self, image: Image.Image):
+        w, h = image.size
+        max_wh = max(w, h)
+        hp = (max_wh - w) // 2
+        vp = (max_wh - h) // 2
+        pad_left = hp
+        pad_right = max_wh - w - hp
+        pad_top = vp
+        pad_bottom = max_wh - h - vp
+        padding = (pad_left, pad_top, pad_right, pad_bottom)  # (left, top, right, bottom)
+        return TF.pad(image, padding, fill=0, padding_mode='constant')
+
+
+def to_hom(X):
+    # get homogeneous coordinates of the input
+    X_hom = torch.cat([X, torch.ones_like(X[..., :1])], dim=-1)
+    return X_hom
+
+# Concat plucker embedding directly to the latent tensor
+# https://github.com/gohyojun15/SplatFlow/blob/main/model/gsdecoder/camera_embedding.py#L26
+# Plucker embedding from Nuscenes dataset
+# https://github.com/valeoai/LaRa/blob/830230ab8dfd67eabe74dd92e03d4881cd950d60/semanticbev/datamodules/components/nuscenes_data.py#L170
+# https://github.com/valeoai/LaRa/blob/830230ab8dfd67eabe74dd92e03d4881cd950d60/semanticbev/models/components/LaRa_embeddings.py#L51
+# SEVA - Stable Virtual Camera
+# https://github.com/Stability-AI/stable-virtual-camera/blob/fe19948e9b7bea261ab2db780a59656131404a83/seva/geometry.py#L119
+def create_plucker_embedding(sensor_sd_token, ref_sd_token, trucksc: TruckScenes, device: torch.device, dtype: torch.dtype, hw=512):
+    _, _, transformation_matrix = frame_conversion.sensor_from_sensor(trucksc, sensor_sd_token, ref_sd_token)
+
+    sensor_sd_rec = trucksc.get('sample_data', sensor_sd_token)
+    calibrated_sensor_t = trucksc.get('calibrated_sensor', sensor_sd_rec['calibrated_sensor_token'])
+    intrinsics = calibrated_sensor_t['camera_intrinsic']
+
+    transformation_matrix = torch.tensor(transformation_matrix, device=device, dtype=dtype)
+    transformation_matrix = transformation_matrix[:3, :]  # Get non-homogeneous 3d points later
+    intrinsics = torch.tensor(intrinsics, device=device, dtype=dtype)
+    
+    # We resize and pad the image, then we encode the image to a latent.
+    updated_intrinsics = intrinsics.clone().to(device=device, dtype=torch.float32)
+    # Add the amount of padding on top of the image
+    padding_top = int((sensor_sd_rec['width']-sensor_sd_rec['height'])/2)
+    updated_intrinsics[1, 2] += padding_top
+    # Divide by stride to get resized intrinsics, hw is the resolution of the image
+    resize_factor = sensor_sd_rec['width']/hw
+    updated_intrinsics[0, 0] /= resize_factor
+    updated_intrinsics[0, 2] /= resize_factor
+    updated_intrinsics[1, 1] /= resize_factor
+    updated_intrinsics[1, 2] /= resize_factor
+
+    y_range = torch.arange(hw, device=device, dtype=torch.float32).add_(0.5)
+    x_range = torch.arange(hw, device=device, dtype=torch.float32).add_(0.5)
+    Y, X = torch.meshgrid(y_range, x_range, indexing="ij")  # [H,W]
+    xy_grid = torch.stack([X, Y], dim=-1).view(-1, 2)  # [HW,2]
+    xy_grid_hom = to_hom(xy_grid)
+
+    # Camera rays at camera coordinate system
+    with torch.amp.autocast("cuda"):
+        grid_3d_cam = xy_grid_hom @ updated_intrinsics.inverse().transpose(-1, -2)
+        # grid_3d_cam = xy_grid_hom @ intrinsics.to(dtype=torch.float32).inverse().transpose(-1, -2)
+    grid_3d_cam = grid_3d_cam.to(dtype=dtype)
+
+    # Camera rays at reference coordinate system
+    grid_3d_cam_hom = to_hom(grid_3d_cam)
+    grid_3d_ref = grid_3d_cam_hom @ transformation_matrix.transpose(-1, -2)
+
+    center_3D_cam = torch.zeros_like(grid_3d_cam)
+    center_3D_cam_hom = to_hom(center_3D_cam)
+    center_3D_ref = center_3D_cam_hom @ transformation_matrix.transpose(-1, -2)
+    rays = grid_3d_ref - center_3D_ref
+
+    # Unit vectors of camera rays
+    rays = torch.nn.functional.normalize(rays, dim=-1)
+
+    camera_origins = center_3D_ref  # Equal to translation_matrix = transformation_matrix[:3, 3]
+    moments = torch.cross(camera_origins, rays, dim=-1)
+    
+    # plucker = torch.cat((camera_origins, rays, moments), dim=-1)
+    plucker = torch.cat((rays, moments), dim=-1)
+    plucker = plucker.permute(1, 0).reshape(-1, hw, hw)
+    return plucker
+
+
 
 class MANTruckscenesDataset(Dataset):
     def __init__(
         self,
+        opt: Options,
         data_dir="/data/man-truckscenes-mini",
         eval_split="mini_val",
         trucksc_version="v1.0-mini",
-        transform=None,
-        resolution=256,
-        max_length=300,
-        img_extension=".png",
         **kwargs,
     ):
         self.data_dir = data_dir[0] if isinstance(data_dir, list) else data_dir
-        self.transform = transform
-        self.resolution = resolution
-        self.max_length = max_length
-        self.default_prompt = "prompt"
-        self.img_extension = img_extension
-
+        self.opt = opt
         self.trucksc = TruckScenes(trucksc_version, self.data_dir, False)
         self.trucksc_dataroot = self.trucksc.dataroot
         scene_tokens = trucksc_read.split_scene_tokens(self.trucksc, eval_split, illuminated_scenes_only=True)
@@ -56,12 +132,9 @@ class MANTruckscenesDataset(Dataset):
                 camera_data = self.trucksc.get('sample_data', camera_token)
                 self.camera_token_to_path[camera_token] = osp.join(self.trucksc_dataroot, camera_data['filename'])
         
-        # del self.trucksc
-
         self.dataset = self.all_frames_tokens
         self.ori_imgs_nums = len(self)
         print(f"Dataset samples: {len(self.dataset)}")
-        print(f"Text max token length: {self.max_length}")
 
 
     def getdata(self, idx):
@@ -69,63 +142,40 @@ class MANTruckscenesDataset(Dataset):
         ref_sensor = 'LIDAR_LEFT'
         ref_token = sample_data[ref_sensor]
 
-
         # Load camera images at time t
         camera_images_t = []
         for camera_view_name in CAMERA_VIEW_NAMES:
             camera_view_token_t = sample_data[camera_view_name]
             camera_image_path_t = self.camera_token_to_path[camera_view_token_t]
             camera_image_t = Image.open(camera_image_path_t)
+            camera_image_t = SquarePadPIL()(camera_image_t)
+            camera_image_t = T.Resize(n_px=self.opt.input_size)(camera_image_t)
             camera_image_t = torch.from_numpy(np.array(camera_image_t).astype(np.float32) / 255) # [512, 512, 4] in [0, 1]
             camera_images_t.append(camera_image_t)
         camera_tensor_t = torch.stack(camera_images_t, dim=0)
 
         # Create plucker embedding
-        # plucker_embeddings_t = []
-        # for camera_view_name in CAMERA_VIEW_NAMES:
-        #     camera_token_t = sample_data[camera_view_name]
-        #     plucker_embedding_t = create_plucker_embedding(camera_token_t, ref_token, self.trucksc, camera_tensor_t.device, camera_tensor_t.dtype)
-        #     plucker_embeddings_t.append(plucker_embedding_t)
-        # plucker_embedding_t = torch.stack(plucker_embeddings_t, dim=0)
+        plucker_embeddings_t = []
+        for camera_view_name in CAMERA_VIEW_NAMES:
+            camera_token_t = sample_data[camera_view_name]
+            plucker_embedding_t = create_plucker_embedding(camera_token_t, ref_token, self.trucksc, camera_tensor_t.device, camera_tensor_t.dtype, hw=self.opt.input_size)
+            plucker_embeddings_t.append(plucker_embedding_t)
+        plucker_embedding_t = torch.stack(plucker_embeddings_t, dim=0)
 
-        # if self.plucker_ray:
-        #     # build ray embeddings for input views
-        #     rays_embeddings = []
-        #     for i in range(self.opt.num_input_views):
-        #         rays_o, rays_d = get_rays(cam_poses_input[i], self.opt.input_size, self.opt.input_size, self.opt.fovy) # [h, w, 3]
-        #         rays_plucker = torch.cat([torch.cross(rays_o, rays_d, dim=-1), rays_d], dim=-1) # [h, w, 6]
-        #         rays_embeddings.append(rays_plucker)
-        #     rays_embeddings = torch.stack(rays_embeddings, dim=0).permute(0, 3, 1, 2).contiguous() # [V, 6, h, w]
-        #     images_input = TF.normalize(images_input, IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
-        #     images_input = torch.cat([images_input, rays_embeddings], dim=1) # [V=4, 9, H, W]
-        #     final_input = {'images': images_input, 'camposes': cam_poses_input} # cam_pose embeded as plucker_rays,
-        # else:
-        images_input = TF.normalize(images_input, IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
-        # final_input = {'images': images_input} #, 'camposes': cam_poses_input}
+        images_input = TF.normalize(camera_tensor_t, IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
+        images_input = torch.cat([images_input, plucker_embedding_t], dim=1) # [V=4, 9, H, W]
 
         point_cloud_tensor = fused_radar_pc.get_fused_radar_pointcloud(self.trucksc, sample_data)
         point_cloud_tensor = fused_radar_pc.filter_fused_radar_pointcloud(point_cloud_tensor, self.trucksc, sample_data, set_z=1.0)
 
         return (
-            images_input,                     # 0
+            images_input,                        # 0
             point_cloud_tensor,                  # 1
-            # plucker_embedding_t,                 # 2
         )
     
-    # Get error instantly. Can be used for debugging
     def __getitem__(self, idx):
         data = self.getdata(idx)
         return data
-
-    # def __getitem__(self, idx):
-    #     for _ in range(10):
-    #         try:
-    #             data = self.getdata(idx)
-    #             return data
-    #         except Exception as e:
-    #             print(f"Error details: {str(e)}")
-    #             idx = idx + 1
-    #     raise RuntimeError("Too many bad data.")
 
     def __len__(self):
         return len(self.dataset)
