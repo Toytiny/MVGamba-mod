@@ -11,5 +11,5 @@ accelerate launch --config_file acc_configs/gpu8x2.yaml \
     --machine_rank $RANK \
     --main_process_ip $MASTER_ADDR \
     --main_process_port $MASTER_PORT \
-    main.py mvgamba \
+    main2.py mvgamba \
     --workspace /workspace_multi_node_train \

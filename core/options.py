@@ -5,6 +5,12 @@ from typing import Tuple, Literal, Dict, Optional
 
 @dataclass
 class Options:
+
+    ## dataset split
+    train_split: str = "mini_train"
+    test_split: str = "mini_val"
+    trucksc_version: str = "v1.0-mini"
+
     ### model
     # Unet image input size
     model_type: str = 'gamba'
@@ -14,7 +20,7 @@ class Options:
     num_input_views: int = 4 # set input view as 4
 
     # patch
-    patch_size: int = 14
+    patch_size: int = 45
     
     # model params
     gs_num: int = 0
@@ -78,7 +84,7 @@ class Options:
     # gradient accumulation
     gradient_accumulation_steps: int = 1
     # training epochs
-    num_epochs: int = 900
+    num_epochs: int = 1000
     # lpips loss weight
     lambda_lpips: float = 0.6
     start_lpips: int = 0
@@ -99,7 +105,7 @@ class Options:
     # augmentation prob for background color
     prob_bg_color: float = 0.5
     # warmup iters for lr
-    warmup_epochs: int = 20
+    warmup_epochs: int = 5
     
     ### testing
     # test image path
@@ -115,6 +121,7 @@ class Options:
     
     # renderig resolution zoom factor for patched rendering
     zoom: int = 3
+
 # all the default settings
 config_defaults: Dict[str, Options] = {}
 config_doc: Dict[str, str] = {}

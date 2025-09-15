@@ -151,96 +151,157 @@ class RotationNet_Hard(nn.Module):
         return rot
 
 class GSDecoder(nn.Module):
-    def __init__(self, transformer_dim, 
-                 SH_degree,
-                 opt,
-                 init_density=0.1, 
-                 clip_scaling=0.1):
-        super(GSDecoder, self).__init__()
+    """
+    Regression XY decoder (all heads use sigmoid mapping).
+      x,y ∈ [-xy_max, xy_max]   (sigmoid → [0,1] → [-xy_max, xy_max])
+      z = z_const
+      rcs ∈ [rcs_low, rcs_high] (sigmoid → [0,1] → [low, high])
+      doppler ∈ [-vmax, vmax]   (sigmoid → [0,1] → [-vmax, vmax])
+    """
+    def __init__(self,
+                 transformer_dim: int,
+                 SH_degree=None,
+                 opt=None,
+                 init_density: float = 0.1,
+                 clip_scaling: float = 0.1):
+        super().__init__()
+
+        # ranges from opt
+        self.xy_max   = float(getattr(opt, 'radar_xy_range', 50.0))
+        self.z_const  = float(getattr(opt, 'radar_z_value',  1.0))
+        self.vmax     = float(getattr(opt, 'radar_vmax',     100.0))
+        self.rcs_low  = float(getattr(opt, 'radar_rcs_low', -100.0))
+        self.rcs_high = float(getattr(opt, 'radar_rcs_high', 100.0))
+
+        # trunk
+        self.mlp_net = MLP(transformer_dim, transformer_dim,
+                           n_neurons=transformer_dim * 4,
+                           n_hidden_layers=1,
+                           activation="silu")
+
+        # heads
+        self.head_xy      = nn.Linear(transformer_dim, 2)
+        self.head_rcs     = nn.Linear(transformer_dim, 1)
+        self.head_doppler = nn.Linear(transformer_dim, 1)
+
+        for head in (self.head_xy, self.head_rcs, self.head_doppler):
+            nn.init.normal_(head.weight, std=1e-3)
+            nn.init.zeros_(head.bias)
+            
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        h = self.mlp_net(feats)                 # [B, K, D]
+
+        raw_xy      = self.head_xy(h)           # [B, K, 2]
+        raw_rcs     = self.head_rcs(h)          # [B, K, 1]
+        raw_doppler = self.head_doppler(h)      # [B, K, 1]
+
+        # === XY with sigmoid to [-xy_max, xy_max] ===
+        x = (2.0 * torch.sigmoid(raw_xy[..., 0:1]) - 1.0) * self.xy_max
+        y = (2.0 * torch.sigmoid(raw_xy[..., 1:2]) - 1.0) * self.xy_max
+
+        # === z constant ===
+        z = feats.new_full(x.shape, self.z_const)
+
+        # === RCS with sigmoid to [rcs_low, rcs_high] ===
+        rcs = self.rcs_low + (self.rcs_high - self.rcs_low) * torch.sigmoid(raw_rcs)
+
+        # === Doppler with sigmoid to [-vmax, vmax] ===
+        doppler = (2.0 * torch.sigmoid(raw_doppler) - 1.0) * self.vmax
+
+        return torch.cat([x, y, z, rcs, doppler], dim=-1)   # [B, K, 5]
+
+# class GSDecoder(nn.Module):
+#     def __init__(self, transformer_dim, 
+#                  SH_degree,
+#                  opt,
+#                  init_density=0.1, 
+#                  clip_scaling=0.1):
+#         super(GSDecoder, self).__init__()
         
-        self.mlp_dim = transformer_dim
-        self.clip_scaling = clip_scaling
+#         self.mlp_dim = transformer_dim
+#         self.clip_scaling = clip_scaling
 
-        self.mlp_net = MLP(transformer_dim, self.mlp_dim, n_neurons=transformer_dim * 4, n_hidden_layers=1, activation="silu")
+#         self.mlp_net = MLP(transformer_dim, self.mlp_dim, n_neurons=transformer_dim * 4, n_hidden_layers=1, activation="silu")
 
-        pos_bound = 0.8
-        coords = torch.linspace(-1 * pos_bound, pos_bound, 21)[None, :].repeat(3, 1)
-        self.register_buffer("coords", coords)
-        # xyz (3) + scale (3) + rot(4) + opacity(1) + SH_0 (3)
-        self.pred_keys = ["xyz", "opacity", "scale", "rot", "rgb"]
+#         pos_bound = 0.8
+#         coords = torch.linspace(-1 * pos_bound, pos_bound, 21)[None, :].repeat(3, 1)
+#         self.register_buffer("coords", coords)
+#         # xyz (3) + scale (3) + rot(4) + opacity(1) + SH_0 (3)
+#         self.pred_keys = ["xyz", "opacity", "scale", "rot", "rgb"]
 
-        self.fix_keys = []
+#         self.fix_keys = []
 
-        self.gs_layer = nn.ModuleDict()
-        for key in self.pred_keys:
-            if key in self.fix_keys:
-                continue
-            if key == "xyz":
-                layer = nn.Linear(self.mlp_dim, 3 * self.coords.size(-1))
-                torch.nn.init.xavier_uniform_(layer.weight)
-                torch.nn.init.constant_(layer.bias,0)
-            elif key == "scale":
-                layer = nn.Linear(self.mlp_dim, 3)
-                nn.init.constant_(layer.bias, -1.8)
-            elif key == "rot":
-                layer = nn.Linear(self.mlp_dim, 32)
-                nn.init.constant_(layer.bias, 0)
-                if opt.use_gumbel_softmax:
-                    self.get_rot = RotationNet_Hard(opt)
-                else:
-                    self.get_rot = RotationNet()
-            elif key == "opacity":
-                layer = nn.Linear(self.mlp_dim, 1)
-                nn.init.constant_(layer.bias, inverse_sigmoid(init_density))
-            elif key == "shs":
-                shs_dim = 3 * (SH_degree + 1) ** 2
-                layer = nn.Linear(self.mlp_dim, int(shs_dim))
-                nn.init.constant_(layer.weight, 0)
-                nn.init.constant_(layer.bias, 0)
-            elif key == "rgb":
-                color_dim = 3
-                layer = nn.Linear(self.mlp_dim, color_dim)
-                nn.init.constant_(layer.weight, 0)
-                nn.init.constant_(layer.bias, 0.0)
-            else:
-                raise NotImplementedError
-            self.gs_layer[key] = layer
+#         self.gs_layer = nn.ModuleDict()
+#         for key in self.pred_keys:
+#             if key in self.fix_keys:
+#                 continue
+#             if key == "xyz":
+#                 layer = nn.Linear(self.mlp_dim, 3 * self.coords.size(-1))
+#                 torch.nn.init.xavier_uniform_(layer.weight)
+#                 torch.nn.init.constant_(layer.bias,0)
+#             elif key == "scale":
+#                 layer = nn.Linear(self.mlp_dim, 3)
+#                 nn.init.constant_(layer.bias, -1.8)
+#             elif key == "rot":
+#                 layer = nn.Linear(self.mlp_dim, 32)
+#                 nn.init.constant_(layer.bias, 0)
+#                 if opt.use_gumbel_softmax:
+#                     self.get_rot = RotationNet_Hard(opt)
+#                 else:
+#                     self.get_rot = RotationNet()
+#             elif key == "opacity":
+#                 layer = nn.Linear(self.mlp_dim, 1)
+#                 nn.init.constant_(layer.bias, inverse_sigmoid(init_density))
+#             elif key == "shs":
+#                 shs_dim = 3 * (SH_degree + 1) ** 2
+#                 layer = nn.Linear(self.mlp_dim, int(shs_dim))
+#                 nn.init.constant_(layer.weight, 0)
+#                 nn.init.constant_(layer.bias, 0)
+#             elif key == "rgb":
+#                 color_dim = 3
+#                 layer = nn.Linear(self.mlp_dim, color_dim)
+#                 nn.init.constant_(layer.weight, 0)
+#                 nn.init.constant_(layer.bias, 0.0)
+#             else:
+#                 raise NotImplementedError
+#             self.gs_layer[key] = layer
     
-    def forward(self, feats):  # (bsz, num_pts, feat_dim)
-        gsparams = []
-        feats = self.mlp_net(feats)
-        for key in self.pred_keys:
-            if key in self.fix_keys:
-                if key == "scale":
-                    fix_v = 0.03 * torch.ones(*feats.shape[:2], 3).to(feats.device)
-                elif key == "rot":
-                    fix_v = torch.zeros(*feats.shape[:2], 4).to(feats.device)
-                    fix_v[:, :, 0] = 1.
-                gsparams.append(fix_v)
-                continue
-            v = self.gs_layer[key](feats)
-            if key == "xyz":
-                # (bsz, num_pts, 3, prob_num)
-                v = v.reshape(*v.shape[:2], 3, -1) 
-                prob = F.softmax(v, dim=-1)
-                assert prob.dtype == torch.float32
-                # coords shape (1, 1, 3, prob_num)
-                v = (prob * self.coords[None, None]).sum(dim=-1)
-            elif key == "scale":
-                v = 0.1 * F.softplus(v)
-            elif key == "rot":
-                v = self.get_rot(v)
-            elif key == "opacity":
-                v = torch.sigmoid(v)
-            elif key == "shs":
-                pass 
-            elif key == "rgb":
-                v = torch.sigmoid(v)
-            else:
-                raise NotImplementedError
-            gsparams.append(v)
+#     def forward(self, feats):  # (bsz, num_pts, feat_dim)
+#         gsparams = []
+#         feats = self.mlp_net(feats)
+#         for key in self.pred_keys:
+#             if key in self.fix_keys:
+#                 if key == "scale":
+#                     fix_v = 0.03 * torch.ones(*feats.shape[:2], 3).to(feats.device)
+#                 elif key == "rot":
+#                     fix_v = torch.zeros(*feats.shape[:2], 4).to(feats.device)
+#                     fix_v[:, :, 0] = 1.
+#                 gsparams.append(fix_v)
+#                 continue
+#             v = self.gs_layer[key](feats)
+#             if key == "xyz":
+#                 # (bsz, num_pts, 3, prob_num)
+#                 v = v.reshape(*v.shape[:2], 3, -1) 
+#                 prob = F.softmax(v, dim=-1)
+#                 assert prob.dtype == torch.float32
+#                 # coords shape (1, 1, 3, prob_num)
+#                 v = (prob * self.coords[None, None]).sum(dim=-1)
+#             elif key == "scale":
+#                 v = 0.1 * F.softplus(v)
+#             elif key == "rot":
+#                 v = self.get_rot(v)
+#             elif key == "opacity":
+#                 v = torch.sigmoid(v)
+#             elif key == "shs":
+#                 pass 
+#             elif key == "rgb":
+#                 v = torch.sigmoid(v)
+#             else:
+#                 raise NotImplementedError
+#             gsparams.append(v)
 
-        return torch.cat(gsparams, dim=-1)
+#         return torch.cat(gsparams, dim=-1)
 
 
 # The most basic version with multi-head attention
@@ -355,7 +416,7 @@ class GSPredictor(nn.Module):
         return outputs
 
 
-class MVGamba(torch.nn.Module):
+class MVGamba2(torch.nn.Module):
     def __init__(self,
         opt: Options,
         **model_kwargs,                     # Keyword arguments for the underlying model.
@@ -406,81 +467,75 @@ class MVGamba(torch.nn.Module):
         return rays_embeddings
     
     def forward(self, data, epoch, step_ratio = 1, vis = 0):
+        """
+        Radar supervision with doppler:
+        - pred_gs: [B, K, 5] = [x, y, z, rcs, doppler]
+        - GT from dataset: data['radar_gt'] with keys:
+              points [B,P,3] or [P,3]
+              rcs    [B,P,1] or [P,1]
+              doppler [B,P,1] or [P]   (prefer [P,1])
+        """
         results = {}
         loss = 0
 
-        cond_poses = data['input']['camposes']
+        # 1) Encode & decode
+
         cond_views = data['input']['images']
-
-        #flatten
-        cond_poses = cond_poses.view(cond_poses.size(0), cond_poses.size(1), -1)  # (bsz, view_num, 16)
-
-        # decoder_out = self.model(cond_views=cond_views.type(self.dtype)) # (bsz, view_num, c, h, w)
-                                #  cam_poses=cond_poses.type(self.dtype)) # (bsz, view_num, 16)
+       
         with autocast(enabled=False):
             decoder_out = self.model(cond_views=cond_views.float())
 
-        with autocast(enabled=False):
-            # bg aug
-            if not self.training or random.random() > self.opt.prob_bg_color:
-                bg_color = torch.ones(3, dtype=torch.float32, device=cond_views.device)
-            else:
-                # random r, g, b
-                r_color = torch.tensor([1, 0, 0], dtype=torch.float32, device=cond_views.device)
-                g_color = torch.tensor([0, 1, 0], dtype=torch.float32, device=cond_views.device)
-                b_color = torch.tensor([0, 0, 1], dtype=torch.float32, device=cond_views.device)
-                bg_color = random.choice([r_color, g_color, b_color])
-            # use the other views for rendering and supervision
-            results = self.gs_render.render(decoder_out['pred_gs'], data['cam_view'], 
-                                            data['cam_view_proj'], data['cam_pos'], bg_color=bg_color)
+        pred_all   = decoder_out['pred_gs']   # [B, K, 5]
+        pred_pts   = pred_all[..., 0:3]       # [B, K, 3]
+        pred_rcs   = pred_all[..., 3:4]       # [B, K, 1]
+        pred_dopp  = pred_all[..., 4:5]       # [B, K, 1]
 
-        pred_images = results['image'] # [B, V, C, output_size, output_size]
-        pred_alphas = results['alpha'] # [B, V, 1, output_size, output_size]
-
-        results['images_pred'] = pred_images
-        results['alphas_pred'] = pred_alphas
-
-        gt_images = data['images_output'] # [B, V, 3, output_size, output_size], ground-truth novel views
-        gt_masks = data['masks_output'] # [B, V, 1, output_size, output_size], ground-truth masks
-
-        gt_images = gt_images * gt_masks + bg_color.view(1, 1, 3, 1, 1) * (1 - gt_masks)
-
-        loss_mse = F.mse_loss(pred_images, gt_images) + F.mse_loss(pred_alphas, gt_masks)
-        # print(f"gt_images: {gt_images.dtype}, pred_images: {pred_images.dtype}, bg_color: {bg_color.dtype}")
-        loss = loss + loss_mse
-
-        if self.opt.lambda_lpips > 0 and epoch >= self.opt.start_lpips :
-            loss_lpips = self.lpips_loss(
-                F.interpolate(gt_images.view(-1, 3, self.opt.output_size, self.opt.output_size) * 2 - 1, (256, 256), mode='bilinear', align_corners=False).type(self.dtype), 
-                F.interpolate(pred_images.view(-1, 3, self.opt.output_size, self.opt.output_size) * 2 - 1, (256, 256), mode='bilinear', align_corners=False).type(self.dtype),
-            ).mean()
-            results['loss_lpips'] = loss_lpips
-            loss = loss + self.opt.lambda_lpips * loss_lpips
+        # 2) Gather GT
+        gt = data['radar_gt']
+        gt_pts = gt['points']      # [B,P,3] / [P,3] / or [3,P] -> 我们统一成 [B,P,3]
+        gt_rcs = gt['rcs']         # [B,P,1] / [P,1] / or [P]   -> 统一 [B,P,1]
+        gt_dop = gt['doppler']  # [B,P,1] / [P,1] / [P]
         
-        # regularization on rot, opacity
-        if self.opt.lambda_reg > 0:
-            loss_reg = 0.
-            opacity = decoder_out['pred_gs'][:, :, 3:4].contiguous().float()
-            loss_reg += (1. - opacity).mean()
-            results['loss_reg'] = loss_reg
-            loss = loss + self.opt.lambda_reg * loss_reg
-        
-        results['loss'] = loss
 
-        assert loss_mse.dtype == torch.float32
+        # 3) Losses
+        # Chamfer-L2 on xyz
+        def chamfer_l2(pred_pts, gt_pts):
+            D = torch.cdist(pred_pts, gt_pts)  # [B,K,P]
+            d1 = D.min(dim=2).values.mean(dim=1)  # pred->gt
+            d2 = D.min(dim=1).values.mean(dim=1)  # gt->pred
+            return (d1 + d2).mean()
+
+        loss_cd = chamfer_l2(pred_pts, gt_pts)
+
+        # NN（rcs & doppler）
+        with torch.no_grad():
+            D = torch.cdist(pred_pts, gt_pts)  # [B,K,P]
+            nn_idx = D.argmin(dim=2)  # [B,K]
+
+        idx_1 = nn_idx.unsqueeze(-1).expand(-1, -1, 1)
+        nn_gt_rcs = torch.gather(gt_rcs, dim=1, index=idx_1)     # [B,K,1]
+        nn_gt_dop = torch.gather(gt_dop, dim=1, index=idx_1)     # [B,K,1]
+
+        loss_rcs = F.l1_loss(pred_rcs,  nn_gt_rcs)
+        loss_dop = F.l1_loss(pred_dopp, nn_gt_dop)
+
+        loss = loss_cd + 0 * loss_rcs + 0 * loss_dop
+
+        results['loss']      = loss
+        results['loss_cd']   = loss_cd
+        results['loss_rcs']  = loss_rcs
+        results['loss_vrel'] = loss_dop
+
         assert loss.dtype == torch.float32
 
-        # metric
-        with torch.no_grad():
-            psnr = -10 * torch.log10(torch.mean((pred_images.detach() - gt_images) ** 2))
-            results['psnr'] = psnr
-        
-            if vis == 1: # scale = 0 for point visulization
-                with autocast(enabled=False):
-                    results_points = self.gs_render.render(decoder_out['pred_gs'], data['cam_view'], 
-                                                data['cam_view_proj'], data['cam_pos'], bg_color=torch.ones(3, dtype=torch.float32, device=cond_views.device), scale_modifier=0.0)
-                    pred_points = results_points['image'] # [B, V, C, output_size, output_size]
-                    results['pred_points'] = pred_points
-            
+
+        results['pred'] = {} 
+        results['gt'] = {}
+        results['gt']['points'] = gt_pts
+        results['gt']['rcs'] = gt_rcs
+        results['gt']['doppler'] = gt_dop
+        results['pred']['points'] = pred_pts.detach()
+        results['pred']['rcs'] = pred_rcs.detach()
+        results['pred']['doppler'] = pred_dopp.detach()
+
         return results
-        
