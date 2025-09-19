@@ -43,6 +43,26 @@ def attr_mae_nn(pred_pts: torch.Tensor, gt_pts: torch.Tensor,
     return mae.mean()
 
 
+# ---------- 工具：统一提取置信度 ----------
+def _extract_pred_conf(out: dict) -> torch.Tensor:
+    """
+    返回 [B,K,1] 的置信度张量：
+    1) 若 pred['points'] 最后一维 >= 6，取第 6 维为 conf；
+    2) 否则若 pred['conf'] 存在，兼容 [B,K] / [B,K,1]；
+    3) 都没有则返回全 1。
+    """
+    pts = out['pred']['points']  # [B,K,3/6]
+    if pts.dim() == 3 and pts.shape[-1] >= 6:
+        return pts[..., 5:6]
+    conf = out['pred'].get('conf', None)
+    if conf is None:
+        B, K = pts.shape[0], pts.shape[1]
+        return torch.ones(B, K, 1, device=pts.device, dtype=pts.dtype)
+    if conf.dim() == 2:
+        conf = conf.unsqueeze(-1)
+    return conf
+
+
 # ---------- 可视化：多视角输入 ----------
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -70,7 +90,7 @@ def _best_denorm(cchw: np.ndarray) -> np.ndarray:
         img3 = np.stack([img01, img01, img01], axis=-1)
         return _to_uint8(img3)
 
-    # C >= 3: 只取前三个通道可视化（RGB）
+    # C >= 3: 只取前三通道可视化（RGB）
     x = x[:3, :, :]
 
     # 候选1：已在[0,1]
@@ -116,6 +136,11 @@ def save_panel_inputs_and_bev(
     max_cols: int = 4,
     s_pred: int = 3, s_gt: int = 3,
     alpha_pred: float = 0.8, alpha_gt: float = 0.6,
+    # ==== 颜色控制（仅影响 Pred 面板）====
+    pred_vmin: float | None = None,
+    pred_vmax: float | None = None,
+    pred_cmap: str = 'seismic',
+    pred_cbar_label: str = 'attr',
 ):
     """
     单张面板：上=多视角RGB；中=对应Plücker(6通道)；下=Pred/GT 的 BEV。
@@ -200,24 +225,30 @@ def save_panel_inputs_and_bev(
         axL.scatter(x_pred, y_pred, s=s_pred, alpha=alpha_pred)
     else:
         sc1 = axL.scatter(
-            x_pred, y_pred, c=c_pred.reshape(-1), s=s_pred, alpha=alpha_pred,
-            cmap='seismic', vmin=ATTR_VMIN, vmax=ATTR_VMAX
+            x_pred, y_pred,
+            c=c_pred.reshape(-1), s=s_pred, alpha=alpha_pred,
+            cmap=pred_cmap, vmin=pred_vmin, vmax=pred_vmax   # 仅 Pred 受控
         )
-        cbar1 = fig.colorbar(sc1, ax=axL, shrink=0.7, pad=0.02); cbar1.set_label('attr', rotation=90)
+        cbar1 = fig.colorbar(sc1, ax=axL, shrink=0.7, pad=0.02)
+        cbar1.set_label(pred_cbar_label, rotation=90)
+
     axL.set_title('Pred (BEV)' + title_suffix)
     axL.set_xlabel('X'); axL.set_ylabel('Y')
     axL.set_aspect('equal', adjustable='box'); axL.set_xlim(xlim); axL.set_ylim(ylim)
     axL.grid(True, ls='--', alpha=0.3)
-
+    
     axR = fig.add_subplot(gs[last_row, right_span])
     if c_gt is None:
         axR.scatter(x_gt, y_gt, s=s_gt, alpha=alpha_gt)
     else:
         sc2 = axR.scatter(
-            x_gt, y_gt, c=c_gt.reshape(-1), s=s_gt, alpha=alpha_gt,
-            cmap='seismic', vmin=ATTR_VMIN, vmax=ATTR_VMAX
+            x_gt, y_gt,
+            c=c_gt.reshape(-1), s=s_gt, alpha=alpha_gt,
+            cmap='seismic', vmin=ATTR_VMIN, vmax=ATTR_VMAX   # GT 保持原配置
         )
-        cbar2 = fig.colorbar(sc2, ax=axR, shrink=0.7, pad=0.02); cbar2.set_label('attr', rotation=90)
+        cbar2 = fig.colorbar(sc2, ax=axR, shrink=0.7, pad=0.02)
+        cbar2.set_label('attr', rotation=90)
+
     axR.set_title('GT (BEV)' + title_suffix)
     axR.set_xlabel('X'); axR.set_ylabel('Y')
     axR.set_aspect('equal', adjustable='box'); axR.set_xlim(xlim); axR.set_ylim(ylim)
@@ -229,6 +260,7 @@ def save_panel_inputs_and_bev(
     plt.close(fig)
     print(f"[save] {save_path}")
 
+
 # ---------- 主测试流程 ----------
 @torch.no_grad()
 def run_test(ckpt_path=None,
@@ -238,7 +270,7 @@ def run_test(ckpt_path=None,
              num_workers=4,
              out_dir="results/vis_eval",
              max_batches=100,           # 只跑前 N 个 batch 做 sanity check；设为 None 跑完整集
-             color_by='rcs'           # 'rcs' | 'doppler' | None
+             color_by='rcs'           # 'rcs' | 'doppler' | 'conf' | None
              ):
     # 1) 配置 & 模型
     opt = Options()  # 用默认配置；如需自定义可改
@@ -273,47 +305,51 @@ def run_test(ckpt_path=None,
 
     os.makedirs(out_dir, exist_ok=True)
 
-        # 3) 遍历 & 计算指标
+    # 3) 遍历 & 计算指标
     meter = {"cd": [], "rcs_mae": [], "dop_mae": []}
 
     # ---------- 第 1 遍：统计全局 vmin/vmax ----------
     global_vmin, global_vmax = None, None
-    need_color = (color_by in ['rcs', 'doppler'])
+    need_color = (color_by in ['rcs', 'doppler', 'conf'])
 
-    # 为了不占显存，这一遍不保存图。mini-val 较小，重复 forward 影响可接受
     if need_color:
-        for bi, data in enumerate(loader):
-            def to_dev(x):
-                if isinstance(x, dict):
-                    return {k: to_dev(v) for k, v in x.items()}
-                elif torch.is_tensor(x):
-                    return x.to(DEVICE, non_blocking=True)
-                else:
-                    return x
-            data = to_dev(data)
-            out = model(data, epoch=0, step_ratio=1.0, vis=1)
+        if color_by == 'conf':
+            # 置信度固定 [0,1]，无需遍历
+            global_vmin, global_vmax = 0.0, 1.0
+            print(f"[global color range] conf: vmin={global_vmin}, vmax={global_vmax}")
+        else:
+            for bi, data in enumerate(loader):
+                def to_dev(x):
+                    if isinstance(x, dict):
+                        return {k: to_dev(v) for k, v in x.items()}
+                    elif torch.is_tensor(x):
+                        return x.to(DEVICE, non_blocking=True)
+                    else:
+                        return x
+                data = to_dev(data)
+                out = model(data, epoch=0, step_ratio=1.0, vis=1)
 
-            # 取出属性（pred/gt 都参与范围）
-            if color_by == 'rcs':
-                pred_attr = out['pred']['rcs']      # [B,K,1]
-                gt_attr   = out['gt']['rcs']        # [B,P,1]
-            else:  # 'doppler'
-                pred_attr = out['pred']['doppler']  # [B,K,1]
-                gt_attr   = out['gt']['doppler']    # [B,P,1]
+                # 取出属性（pred/gt 都参与范围）
+                if color_by == 'rcs':
+                    pred_attr = out['pred']['rcs']      # [B,K,1]
+                    gt_attr   = out['gt']['rcs']        # [B,P,1]
+                else:  # 'doppler'
+                    pred_attr = out['pred']['doppler']  # [B,K,1]
+                    gt_attr   = out['gt']['doppler']    # [B,P,1]
 
-            # 转到 numpy 并打平
-            c_pred = pred_attr.detach().cpu().numpy().reshape(-1)
-            c_gt   = gt_attr.detach().cpu().numpy().reshape(-1)
+                # 转到 numpy 并打平
+                c_pred = pred_attr.detach().cpu().numpy().reshape(-1)
+                c_gt   = gt_attr.detach().cpu().numpy().reshape(-1)
 
-            # 更新全局范围（跳过 NaN）
-            c_all = np.concatenate([c_pred, c_gt])
-            c_all = c_all[~np.isnan(c_all)]
-            if c_all.size > 0:
-                vmin_batch, vmax_batch = float(c_all.min()), float(c_all.max())
-                global_vmin = vmin_batch if global_vmin is None else min(global_vmin, vmin_batch)
-                global_vmax = vmax_batch if global_vmax is None else max(global_vmax, vmax_batch)
+                # 更新全局范围（跳过 NaN）
+                c_all = np.concatenate([c_pred, c_gt])
+                c_all = c_all[~np.isnan(c_all)]
+                if c_all.size > 0:
+                    vmin_batch, vmax_batch = float(c_all.min()), float(c_all.max())
+                    global_vmin = vmin_batch if global_vmin is None else min(global_vmin, vmin_batch)
+                    global_vmax = vmax_batch if global_vmax is None else max(global_vmax, vmax_batch)
 
-        print(f"[global color range] {color_by}: vmin={global_vmin}, vmax={global_vmax}")
+            print(f"[global color range] {color_by}: vmin={global_vmin}, vmax={global_vmax}")
 
     # ---------- 第 2 遍：计算指标 + 全量出图 ----------
     # 重新建一个 loader（上面的 loader 可能已经被消费完）
@@ -341,8 +377,13 @@ def run_test(ckpt_path=None,
 
         out = model(data, epoch=0, step_ratio=1.0, vis=1)
 
-                # ----- 取点云 -----
-        pred_pts = out['pred']['points']      # [B,K,3]
+        # ==== confidence 可视化筛选参数（可放在 for bi 外面）====
+        CONF_THRESH = float(getattr(opt, "conf_thresh", 0))   # 置信度阈值
+        MIN_KEEP    = int(getattr(opt, "conf_min_keep", 1296))  # 阈值太高时，至少保留这么多点
+        K_EVAL_CAP  = int(getattr(opt, "K_eval", 8192))         # 进一步上限，避免图太密/太慢
+
+        # ----- 取点云 -----
+        pred_pts = out['pred']['points']      # [B,K,3] 或 [B,K,6]
         pred_rcs = out['pred']['rcs']         # [B,K,1]
         pred_dop = out['pred']['doppler']     # [B,K,1]
         gt_pts   = out['gt']['points']        # [B,P,3]
@@ -387,78 +428,113 @@ def run_test(ckpt_path=None,
 
         print(f"[batch {bi}] cd={cd:.4f}  rcs_mae={rcs_mae:.4f}  dop_mae={dop_mae:.4f}  eval_loss={eval_loss:.4f}")
 
-
         # 遍历本 batch 里的每个样本：保存组合面板
         B = pred_pts.shape[0]
         input_imgs = data['input']['images']  # [B,V,C,H,W]
 
+        # 统一提取本 batch 的置信度
+        pred_conf_b = _extract_pred_conf(out)  # [B,K,1]
+
         for b in range(B):
-                    # 遍历本 batch 里的每个样本：保存组合面板
-            B = pred_pts.shape[0]
-            input_imgs = data['input']['images']  # [B,V,C,H,W]
+            # ===== 解析输出（兼容 5/6 维两种结构）=====
+            pts_full = out['pred']['points'][b]        # shape 可能是 [K,3] 或 [K,6]
+            if pts_full.shape[-1] >= 3:
+                p_xyz = pts_full[..., :3]              # [K,3]
+            else:
+                raise ValueError("pred['points'] last dim < 3")
 
-            # ====== NEW: 准备 CSV 路径（样本级）======
-            csv_path = os.path.join(out_dir, "xy_stats.csv")
-            if (bi == 0) and (sample_counter == 0) and (not os.path.exists(csv_path)):
-                with open(csv_path, "w") as f:
-                    f.write("sample_id,px_min,px_max,px_mean,py_min,py_max,py_mean,gx_min,gx_max,gx_mean,gy_min,gy_max,gy_mean\n")
+            p_rcs  = out['pred']['rcs'][b].reshape(-1, 1)       # [K,1]
+            p_dopp = out['pred']['doppler'][b].reshape(-1, 1)   # [K,1]
+            p_conf = pred_conf_b[b]                             # [K,1]
 
-            for b in range(B):
-                p_pred = pred_pts[b].detach().cpu().numpy()
-                p_gt   = gt_pts[b].detach().cpu().numpy()
+            # ===== 根据阈值筛选（不足 MIN_KEEP 用 Top-K 回填；再截断到 K_EVAL_CAP）=====
+            conf_flat = p_conf.squeeze(-1)
+            mask = conf_flat >= CONF_THRESH
+            keep_idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
 
-                # ====== NEW: per-sample XY 统计并打印 ======
-                px = p_pred[:, 0];  py = p_pred[:, 1]
-                gx = p_gt[:, 0];    gy = p_gt[:, 1]
-                px_min, px_max, px_mean = float(px.min()), float(px.max()), float(px.mean())
-                py_min, py_max, py_mean = float(py.min()), float(py.max()), float(py.mean())
-                gx_min, gx_max, gx_mean = float(gx.min()), float(gx.max()), float(gx.mean())
-                gy_min, gy_max, gy_mean = float(gy.min()), float(gy.max()), float(gy.mean())
+            if keep_idx.numel() < min(MIN_KEEP, p_xyz.shape[0]):
+                # 用 Top-K(conf) 进行回填
+                k_fill = min(max(MIN_KEEP, keep_idx.numel()), p_xyz.shape[0])
+                topk_idx = torch.topk(conf_flat, k=k_fill, dim=0).indices
+                keep_idx = topk_idx
 
-                print(
-                    f"[sample {sample_counter:06d}] "
-                    f"pred_x[min,max,mean]=[{px_min:.2f},{px_max:.2f},{px_mean:.2f}]  "
-                    f"pred_y[min,max,mean]=[{py_min:.2f},{py_max:.2f},{py_mean:.2f}]  |  "
-                    f"gt_x[min,max,mean]=[{gx_min:.2f},{gx_max:.2f},{gx_mean:.2f}]  "
-                    f"gt_y[min,max,mean]=[{gy_min:.2f},{gy_max:.2f},{gy_mean:.2f}]"
-                )
+            if keep_idx.numel() > K_EVAL_CAP:
+                # 截断到最多 K_EVAL_CAP（仍按 conf 排序）
+                k_cap_idx = torch.topk(conf_flat[keep_idx], k=K_EVAL_CAP, dim=0).indices
+                keep_idx = keep_idx[k_cap_idx]
 
-                # ====== NEW: 追加到 CSV ======
-                with open(csv_path, "a") as f:
-                    f.write("{:06d},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f}\n".format(
-                        sample_counter,
-                        px_min, px_max, px_mean, py_min, py_max, py_mean,
-                        gx_min, gx_max, gx_mean, gy_min, gy_max, gy_mean
-                    ))
+            # 实际筛选出的预测
+            p_pred_xyz = p_xyz[keep_idx]        # [K_sel,3]
+            p_pred_rcs = p_rcs[keep_idx]        # [K_sel,1]
+            p_pred_dop = p_dopp[keep_idx]       # [K_sel,1]
+            p_pred_conf= p_conf[keep_idx]       # [K_sel,1]
 
-                # （之后照常出图）
-                if color_by == 'rcs':
-                    c_pred = pred_rcs[b].detach().cpu().numpy().reshape(-1)
-                    c_gt   = gt_rcs[b].detach().cpu().numpy().reshape(-1)
-                    title_suffix = " (RCS)"
-                elif color_by == 'doppler':
-                    c_pred = pred_dop[b].detach().cpu().numpy().reshape(-1)
-                    c_gt   = gt_dop[b].detach().cpu().numpy().reshape(-1)
-                    title_suffix = " (Doppler)"
-                else:
-                    c_pred = None; c_gt = None; title_suffix = ""
+            # ===== 取 GT =====
+            p_gt   = gt_pts[b].detach().cpu().numpy()
 
-                save_png_panel = os.path.join(out_dir, f"panel_sample{sample_counter:06d}.png")
-                save_panel_inputs_and_bev(
-                    mviews=input_imgs[b],          # [V,C,H,W]
-                    p_pred=p_pred, p_gt=p_gt,
-                    c_pred=c_pred, c_gt=c_gt,
-                    save_path=save_png_panel,
-                    title_suffix=title_suffix,
-                    max_cols=4,
-                    s_pred=3, s_gt=3,
-                    alpha_pred=0.8, alpha_gt=0.6,
-                )
+            # ===== 打印一些统计（可选）=====
+            kept = int(keep_idx.numel())
+            thr  = float(CONF_THRESH)
+            cmean= float(p_pred_conf.mean().item())
+            print(f"[sample {sample_counter:06d}] conf>= {thr:.2f} -> keep {kept} / {p_xyz.shape[0]} (mean={cmean:.3f})")
 
-                sample_counter += 1
+            # ===== 可视化分支 =====
+            if color_by == 'conf':
+                # 用置信度上色：范围 [0,1]，色条标注为 'conf'
+                c_pred = p_pred_conf.detach().cpu().numpy().reshape(-1)
+                c_gt   = None
+                title_suffix = " (Conf)"
+                pred_vmin, pred_vmax = 0.0, 1.0
+                pred_cbar_label = 'conf'
+            elif color_by == 'rcs':
+                c_pred = p_pred_rcs.detach().cpu().numpy().reshape(-1)
+                c_gt   = gt_rcs[b].detach().cpu().numpy().reshape(-1)
+                title_suffix = " (RCS)"
+                pred_vmin = pred_vmax = None
+                pred_cbar_label = 'attr'
+            elif color_by == 'doppler':
+                c_pred = p_pred_dop.detach().cpu().numpy().reshape(-1)
+                c_gt   = gt_dop[b].detach().cpu().numpy().reshape(-1)
+                title_suffix = " (Doppler)"
+                pred_vmin = pred_vmax = None
+                pred_cbar_label = 'attr'
+            else:
+                c_pred = None; c_gt = None; title_suffix = ""
+                pred_vmin = pred_vmax = None
+                pred_cbar_label = 'attr'
 
+            save_png_panel = os.path.join(out_dir, f"panel_sample{sample_counter:06d}.png")
+            save_panel_inputs_and_bev(
+                mviews=input_imgs[b],
+                p_pred=p_pred_xyz.detach().cpu().numpy(),
+                p_gt=gt_pts[b].detach().cpu().numpy(),
+                c_pred=c_pred, c_gt=c_gt,
+                save_path=save_png_panel,
+                title_suffix=title_suffix,
+                max_cols=4,
+                s_pred=3, s_gt=3,
+                alpha_pred=0.8, alpha_gt=0.6,
+                # 置信度/属性的色域与标签
+                pred_vmin=pred_vmin, pred_vmax=pred_vmax,
+                pred_cmap='viridis' if color_by=='conf' else 'seismic',
+                pred_cbar_label=pred_cbar_label,
+            )
 
+            # （可选）顺便把 conf 直方图存一张，调阈值很有用
+            hist_path = os.path.join(out_dir, f"conf_hist_{sample_counter:06d}.png")
+            try:
+                plt.figure(figsize=(4,3))
+                plt.hist(conf_flat.detach().cpu().numpy(), bins=50, range=(0,1))
+                plt.title(f"Conf Histogram (sample {sample_counter:06d})")
+                plt.xlabel("confidence"); plt.ylabel("count")
+                plt.tight_layout(); plt.savefig(hist_path, dpi=160); plt.close()
+            except Exception as e:
+                print(f"[warn] save conf hist failed: {e}")
 
+            sample_counter += 1
+
+        if max_batches is not None and (bi + 1) >= max_batches:
+            break
 
     # 4) 汇总
     def _mean(x): return float(np.mean(x)) if len(x) > 0 else float("nan")
@@ -481,15 +557,16 @@ def run_test(ckpt_path=None,
 
     return summary
 
+
 if __name__ == "__main__":
     # 示例：根据需要替换 ckpt_path/eval_split 等
     run_test(
-        ckpt_path="/home/fangqiang.d/MVGamba/results/mvgamba_man_1_cd/checkpoint_ep1499.pth",               # e.g. "results/mvgamba_man/checkpoint_ep090.pth"
+        ckpt_path="/home/fangqiang.d/MVGamba/results/mvgamba_man_1_wcd/checkpoint_ep2600.pth",
         data_mode='s3',
         eval_split='mini_train',
         batch_size=64,
         num_workers=8,
-        out_dir="results/mvgamba_man_1_cd/vis_train",
+        out_dir="results/mvgamba_man_1_wcd/vis_train",
         max_batches=1000,
-        color_by='doppler',               # 'rcs' or 'doppler' or None
+        color_by='conf',               # 'rcs' or 'doppler' or 'conf' or None
     )

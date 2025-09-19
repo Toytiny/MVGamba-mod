@@ -183,10 +183,12 @@ class MANTruckscenesDataset(Dataset):
             pcl, self.trucksc, sample_rec, set_z=1.0
         )
         point_cloud = pcl.points
+
+        rng = np.random.default_rng(20250919)
         K = 1296    # controlled by the input size and patch size
         P = point_cloud.shape[1]
         replace = P < K
-        idxs = np.random.choice(P, size=K, replace=replace)
+        idxs = rng.choice(P, size=K, replace=replace)
         pts  = point_cloud[0:3, idxs].T.astype(np.float32)        # [K,3]
         vrel = point_cloud[3:6, idxs].T.astype(np.float32)        # [K,3]
         rcs  = point_cloud[6, idxs][:, None].astype(np.float32)   # [K,1]

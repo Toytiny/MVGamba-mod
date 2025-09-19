@@ -78,7 +78,7 @@ def main():
         "weight_decay": 0.0,
     }]
 
-    optimizer = torch.optim.AdamW(parameters, lr=opt.lr, betas=(0.9, 0.95))
+    optimizer = torch.optim.Adam(parameters, lr=opt.lr, betas=(0.9, 0.95))
     if accelerator.is_main_process:
         print(f"model parameters: {sum(p.numel() for p in model.parameters())}")
 
@@ -93,8 +93,8 @@ def main():
     # )
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
-        step_size=50,   # 每 50 个 iter 衰减一次
-        gamma=0.5        # 衰减系数 0.5
+        step_size=10,   # 每 50 个 iter 衰减一次
+        gamma=0.9        # 衰减系数 0.5
     )
 
     # -----------------------
@@ -228,7 +228,6 @@ def main():
         total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
         total_loss_cd = accelerator.gather_for_metrics(total_loss_cd).mean()
         total_loss_rcs = accelerator.gather_for_metrics(total_loss_rcs).mean()
-        print(total_loss_vrel)
         total_loss_vrel = accelerator.gather_for_metrics(total_loss_vrel).mean()
 
         if accelerator.is_main_process:

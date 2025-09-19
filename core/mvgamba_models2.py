@@ -151,65 +151,64 @@ class RotationNet_Hard(nn.Module):
         return rot
 
 class GSDecoder(nn.Module):
-    """
-    Regression XY decoder (all heads use sigmoid mapping).
-      x,y ∈ [-xy_max, xy_max]   (sigmoid → [0,1] → [-xy_max, xy_max])
-      z = z_const
-      rcs ∈ [rcs_low, rcs_high] (sigmoid → [0,1] → [low, high])
-      doppler ∈ [-vmax, vmax]   (sigmoid → [0,1] → [-vmax, vmax])
-    """
-    def __init__(self,
-                 transformer_dim: int,
-                 SH_degree=None,
-                 opt=None,
-                 init_density: float = 0.1,
-                 clip_scaling: float = 0.1):
+    def __init__(self, transformer_dim:int, SH_degree=None, opt=None,
+                 init_density:float=0.1, clip_scaling:float=0.1,
+                 points_per_token:int=6, use_sigmoid_xy:bool=True):
         super().__init__()
+        self.M = points_per_token
+        self.use_sigmoid_xy = use_sigmoid_xy
 
-        # ranges from opt
+        # ranges
         self.xy_max   = float(getattr(opt, 'radar_xy_range', 50.0))
-        self.z_const  = float(getattr(opt, 'radar_z_value',  1.0))
         self.vmax     = float(getattr(opt, 'radar_vmax',     100.0))
         self.rcs_low  = float(getattr(opt, 'radar_rcs_low', -100.0))
         self.rcs_high = float(getattr(opt, 'radar_rcs_high', 100.0))
+        self.rcs_center = 0.5 * (self.rcs_low + self.rcs_high)
+        self.rcs_range  = 0.5 * (self.rcs_high - self.rcs_low)
 
         # trunk
         self.mlp_net = MLP(transformer_dim, transformer_dim,
-                           n_neurons=transformer_dim * 4,
-                           n_hidden_layers=1,
-                           activation="silu")
+                           n_neurons=transformer_dim*4, n_hidden_layers=1, activation="silu")
 
-        # heads
-        self.head_xy      = nn.Linear(transformer_dim, 2)
-        self.head_rcs     = nn.Linear(transformer_dim, 1)
-        self.head_doppler = nn.Linear(transformer_dim, 1)
+        D = transformer_dim; M = self.M
+        # multi-point heads (flatten last dim -> reshape [B,K,M,*])
+        self.head_xy      = nn.Linear(D, 2*M)
+        self.head_rcs     = nn.Linear(D, 1*M)
+        self.head_doppler = nn.Linear(D, 1*M)
+        self.head_conf    = nn.Linear(D, 1*M)
 
-        for head in (self.head_xy, self.head_rcs, self.head_doppler):
-            nn.init.normal_(head.weight, std=1e-3)
-            nn.init.zeros_(head.bias)
-            
+        for h in (self.head_xy, self.head_rcs, self.head_doppler, self.head_conf):
+            nn.init.normal_(h.weight, std=1e-3); nn.init.zeros_(h.bias)
 
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        h = self.mlp_net(feats)                 # [B, K, D]
+    def forward(self, feats: torch.Tensor):
+        # feats: [B,K,D]
+        B,K,_ = feats.shape
+        h = self.mlp_net(feats)
 
-        raw_xy      = self.head_xy(h)           # [B, K, 2]
-        raw_rcs     = self.head_rcs(h)          # [B, K, 1]
-        raw_doppler = self.head_doppler(h)      # [B, K, 1]
+        def viewM(t, c):  # map linear head -> [B,K,M,c]
+            return t(h).view(B, K, self.M, c)
 
-        # === XY with sigmoid to [-xy_max, xy_max] ===
-        x = (2.0 * torch.sigmoid(raw_xy[..., 0:1]) - 1.0) * self.xy_max
-        y = (2.0 * torch.sigmoid(raw_xy[..., 1:2]) - 1.0) * self.xy_max
+        raw_xy  = viewM(self.head_xy,      2)
+        raw_rcs = viewM(self.head_rcs,     1)
+        raw_dop = viewM(self.head_doppler, 1)
+        raw_cf  = viewM(self.head_conf,    1)
 
-        # === z constant ===
-        z = feats.new_full(x.shape, self.z_const)
+        if self.use_sigmoid_xy:
+            x = self.xy_max * (2*torch.sigmoid(raw_xy[...,0:1]) - 1.0)
+            y = self.xy_max * (2*torch.sigmoid(raw_xy[...,1:2]) - 1.0)
+        else:
+            x = self.xy_max * torch.tanh(raw_xy[...,0:1])
+            y = self.xy_max * torch.tanh(raw_xy[...,1:2])
 
-        # === RCS with sigmoid to [rcs_low, rcs_high] ===
-        rcs = self.rcs_low + (self.rcs_high - self.rcs_low) * torch.sigmoid(raw_rcs)
+        z = feats.new_full((B, K, self.M, 1), 1.0) 
+        rcs     = self.rcs_center + self.rcs_range * torch.tanh(raw_rcs)
+        doppler = self.vmax * torch.tanh(raw_dop)
+        conf    = torch.sigmoid(raw_cf)
 
-        # === Doppler with sigmoid to [-vmax, vmax] ===
-        doppler = (2.0 * torch.sigmoid(raw_doppler) - 1.0) * self.vmax
-
-        return torch.cat([x, y, z, rcs, doppler], dim=-1)   # [B, K, 5]
+        pts = torch.cat([x,y,z,rcs,doppler,conf], dim=-1)  # [B,K,M,5]
+        pts  = pts.view(B, K*self.M, 6)
+     
+        return pts
 
 # class GSDecoder(nn.Module):
 #     def __init__(self, transformer_dim, 
@@ -486,26 +485,61 @@ class MVGamba2(torch.nn.Module):
             decoder_out = self.model(cond_views=cond_views.float())
 
         pred_all   = decoder_out['pred_gs']   # [B, K, 5]
+        pred_conf  = pred_all[..., 5:6]       # [B, KM, 1]
         pred_pts   = pred_all[..., 0:3]       # [B, K, 3]
         pred_rcs   = pred_all[..., 3:4]       # [B, K, 1]
         pred_dopp  = pred_all[..., 4:5]       # [B, K, 1]
 
         # 2) Gather GT
         gt = data['radar_gt']
-        gt_pts = gt['points']      # [B,P,3] / [P,3] / or [3,P] -> 我们统一成 [B,P,3]
-        gt_rcs = gt['rcs']         # [B,P,1] / [P,1] / or [P]   -> 统一 [B,P,1]
+        gt_pts = gt['points']      # [B,P,3] / [P,3] / or [3,P] 
+        gt_rcs = gt['rcs']         # [B,P,1] / [P,1] / or [P]   
         gt_dop = gt['doppler']  # [B,P,1] / [P,1] / [P]
         
+        B, KM, P = pred_pts.shape[0], pred_pts.shape[1], gt_pts.shape[1]
 
-        # 3) Losses
-        # Chamfer-L2 on xyz
-        def chamfer_l2(pred_pts, gt_pts):
-            D = torch.cdist(pred_pts, gt_pts)  # [B,K,P]
-            d1 = D.min(dim=2).values.mean(dim=1)  # pred->gt
-            d2 = D.min(dim=1).values.mean(dim=1)  # gt->pred
-            return (d1 + d2).mean()
+         # ------------------------- (1) confidence loss（3D） -------------------------
+        # 软目标：t_soft = exp(- d_min / tau)，再缩放到均值≈P/KM（把基数约束并进来）
+        with torch.no_grad():
+            D3   = torch.cdist(pred_pts, gt_pts)            # [B,KM,P]
+            dmin = D3.min(dim=2).values                     # [B,KM]
 
-        loss_cd = chamfer_l2(pred_pts, gt_pts)
+        tau = float(getattr(self.opt, "conf_tau", 2.0))     # m
+        t_soft = torch.exp(-dmin / max(1e-6, tau)).unsqueeze(-1)  # [B,KM,1] ∈ (0,1)
+
+        r = (P / max(1, KM))                                # 目标占比
+        t_mean = t_soft.mean(dim=1, keepdim=True).clamp_min(1e-6)
+        t_target = (t_soft / t_mean) * r                    # 调整均值到 r
+        t_target = t_target.clamp(0.0, 1.0)
+
+        # 用 MSE 拟合置信度（稳定简洁）
+        loss_conf = torch.mean((pred_conf - t_target).pow(2))
+        w_conf = float(getattr(self.opt, "w_conf", 0.5))
+
+        # ------------------------- (2) 3D geometric loss（Top-K by conf） -------------------------
+        keep_ratio = float(getattr(self.opt, "keep_ratio", 1.25))   # 约 1.0~1.5
+        Kkeep = max(1, min(KM, int(keep_ratio * P)))
+
+        # 注意：几何项仅用 conf 选点，不让其反传几何梯度
+        idx_topk = pred_conf.detach().squeeze(-1).topk(Kkeep, dim=1).indices  # [B,Kkeep]
+        def G(t): return t.gather(1, idx_topk.unsqueeze(-1).expand(-1, -1, t.size(-1)))
+
+        pred_pts_k = G(pred_pts)   # [B,Kkeep,3]
+
+        # 3D Chamfer（与全部 GT 对齐，更稳）
+        cd_clip = float(getattr(self.opt, "cd_clip", 60.0))          # m
+        Dk = torch.cdist(pred_pts_k, gt_pts)
+        if cd_clip is not None:
+            Dk = torch.clamp(Dk, max=cd_clip)
+        d1 = Dk.min(dim=2).values.mean(dim=1)   # pred->gt
+        d2 = Dk.min(dim=1).values.mean(dim=1)   # gt->pred
+        loss_3d = (d1 + d2).mean()
+
+        w_3d = float(getattr(self.opt, "w_3d", 1.0))  # 仅 3D，不含 BEV
+
+        # ------------------------- 总损失（两项） -------------------------
+        loss_cd = w_3d * loss_3d + w_conf * loss_conf
+
 
         # NN（rcs & doppler）
         with torch.no_grad():
@@ -519,7 +553,7 @@ class MVGamba2(torch.nn.Module):
         loss_rcs = F.l1_loss(pred_rcs,  nn_gt_rcs)
         loss_dop = F.l1_loss(pred_dopp, nn_gt_dop)
 
-        loss = loss_cd + 0 * loss_rcs + 0 * loss_dop
+        loss = loss_cd + 0 * loss_rcs + 0 * loss_dop 
 
         results['loss']      = loss
         results['loss_cd']   = loss_cd
@@ -537,5 +571,6 @@ class MVGamba2(torch.nn.Module):
         results['pred']['points'] = pred_pts.detach()
         results['pred']['rcs'] = pred_rcs.detach()
         results['pred']['doppler'] = pred_dopp.detach()
+        results['pred']['conf'] = pred_conf.detach()
 
         return results
